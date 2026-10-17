@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Community event board storage and scoped application permissions
+Parameters:
+  ProjectName:
+    Type: String
+    Default: community-board
+    AllowedPattern: '[a-z][a-z0-9-]{2,30}'
+  ImagePrefix:
+    Type: String
+    Default: images/
+    AllowedValues: [images/]
+  CloudFrontDomain:
+    Type: String
+    Description: >-
+      Viewer domain allowed by bucket CORS, without scheme (for example
+      d111111abcdef8.cloudfront.net). Required with no default: a CloudFront
+      domain is only known after the Issue #5 distribution is created, so the
+      storage stack is deployed or updated once that domain has been read from
+      the alb-cloudfront stack outputs.
+Resources:
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-events'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+        - {AttributeName: SK, AttributeType: S}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+        - {AttributeName: SK, KeyType: RANGE}
+      SSESpecification: {SSEEnabled: true}
+      # Scenario requirement: events older than 1 year are archivable.
+      # DynamoDB TTL is epoch-seconds and deletion happens within ~48h of the
+      # expiry instant, so an item is written with expiresAt = created + 1 year.
+      # Items without the attribute are never expired, so this is additive: an
+      # existing item that omits expiresAt stays readable indefinitely.
+      #
+      # expiresAt is deliberately NOT in AttributeDefinitions. DynamoDB rejects
+      # the table with "Number of attributes in KeySchema does not exactly match
+      # number of attributes defined in AttributeDefinitions" if AttributeDefinitions
+      # lists anything outside the key schema. Non-key attributes are schemaless,
+      # so a TTL attribute needs no declaration at all.
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # A MetricsConfigurations entry is itself what enables the per-request
+      # CloudWatch metrics the StorageErrorAlarm reads; there is no separate
+      # enable flag. AWS::S3::Bucket has no BucketLevelMetrics property and no
+      # RequestMetrics property - both were rejected by EarlyValidation during
+      # deployment with "Unsupported property". MetricsConfiguration accepts
+      # only Id, Prefix, AccessPointArn and TagFilters.
+      MetricsConfigurations:
+        - Id: BucketLevelMetrics
+          Prefix: ''
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Sub 'https://${CloudFrontDomain}']
+            AllowedMethods: [GET, PUT, HEAD]
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}
+      Policies:
+        - PolicyName: event-storage-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem', 'dynamodb:Query', 'dynamodb:Scan']
+                Resource: !GetAtt EventsTable.Arn
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject']
+                Resource: !Sub '${ImagesBucket.Arn}/${ImagePrefix}*'
+Outputs:
+  EventsTableName: {Value: !Ref EventsTable}
+  ImagesBucketName: {Value: !Ref ImagesBucket}
+  ImagePrefix: {Value: !Ref ImagePrefix}
+  AppRoleArn: {Value: !GetAtt AppRole.Arn}

@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Community Event Board Issue 4 EC2 stub host
+Parameters:
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 AMI resolved from the regional SSM public parameter.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro]
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR for the poc VPC (two public subnets; ALB in Issue 5 needs two AZs).
+  AppRoleArn:
+    Type: String
+    Description: Existing storage AppRole ARN (from community-board-storage stack outputs); pass at deploy time. The deployment identity must have iam:PassRole for this ARN.
+Resources:
+  PocVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: community-board-poc-vpc}]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PocVpc
+      InternetGatewayId: !Ref InternetGateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PocVpc
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PocVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PocVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+  SubnetRouteAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+  SubnetRouteAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB security group placeholder; Issue 5 adds ingress rules.
+      VpcId: !Ref PocVpc
+      SecurityGroupEgress: []
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow HTTP from the ALB security group only (Issue 5 cutover: temporary tester ingress removed, EIP released).'
+      VpcId: !Ref PocVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Select [1, !Split ['/', !Ref AppRoleArn]]
+  StubInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref AppInstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref PublicSubnetA
+          GroupSet: [!Ref Ec2SecurityGroup]
+          AssociatePublicIpAddress: false
+      UserData:
+        Fn::Base64: !Sub |
+          #cloud-config
+          # No `packages:` block on purpose. AL2023 ships python3, and a package
+          # list makes cloud-init run package-update-upgrade-install first, which
+          # needs outbound network. The sandbox has no working egress, so that
+          # module hangs inside modules:final and scripts-user (runcmd) never
+          # executes, leaving the responder service never started. Using the
+          # AMI's own python3 keeps instance boot network-independent.
+          write_files:
+            - path: /opt/community-board/server.py
+              owner: root:root
+              permissions: '0755'
+              content: |
+                from http.server import BaseHTTPRequestHandler, HTTPServer
+                import json
+
+                class Handler(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        if self.path not in ("/health", "/events"):
+                            self.send_error(404)
+                            return
+                        payload = {"status": "ok"} if self.path == "/health" else {"events": [], "stub": True}
+                        body = json.dumps(payload).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+
+                HTTPServer(("0.0.0.0", 80), Handler).serve_forever()
+            - path: /etc/systemd/system/community-board-stub.service
+              owner: root:root
+              permissions: '0644'
+              content: |
+                [Unit]
+                Description=Community Event Board stub responder
+                After=network.target
+
+                [Service]
+                ExecStart=/usr/bin/python3 /opt/community-board/server.py
+                Restart=always
+                User=root
+
+                [Install]
+                WantedBy=multi-user.target
+          runcmd:
+            - [systemctl, daemon-reload]
+            - [systemctl, enable, --now, community-board-stub.service]
+Outputs:
+  VpcId:
+    Value: !Ref PocVpc
+    Description: Poc VPC for Issue 5 ALB subnets.
+  PublicSubnetIds:
+    Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Description: Public subnets across two AZs for Issue 5 ALB.
+  InstanceId:
+    Value: !Ref StubInstance
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+  Ec2SecurityGroupId:
+    Value: !Ref Ec2SecurityGroup
+  AppRoleArn:
+    Value: !Ref AppRoleArn
+    Description: Existing role in the instance profile; grant iam:PassRole to the deployment identity for this ARN.

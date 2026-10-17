@@ -1,0 +1,62 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFront-only alarms and dashboard; deploy this stack in us-east-1
+Parameters:
+  DistributionId:
+    Type: String
+    Description: CloudFront distribution id from the delivery stack outputs.
+  EvaluationPeriods:
+    Type: Number
+    Default: 2
+    Description: Consecutive periods that must breach before the alarm fires.
+  DatapointsToAlarm:
+    Type: Number
+    Default: 2
+    Description: Breaching datapoints required within EvaluationPeriods.
+Resources:
+  CloudFront5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-cloudfront-5xx'
+      AlarmDescription: CloudFront returned 5xx errors to viewers.
+      Namespace: AWS/CloudFront
+      MetricName: 5xxErrorRate
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref DistributionId
+        - Name: Region
+          Value: Global
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: !Ref EvaluationPeriods
+      DatapointsToAlarm: !Ref DatapointsToAlarm
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-overview'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 24, "height": 6,
+              "properties": {
+                "title": "CloudFront viewer metrics",
+                "region": "us-east-1",
+                "stat": "Average",
+                "metrics": [
+                  ["AWS/CloudFront", "4xxErrorRate", "DistributionId", "${DistributionId}", "Region", "Global"],
+                  ["AWS/CloudFront", "5xxErrorRate", "DistributionId", "${DistributionId}", "Region", "Global"],
+                  ["AWS/CloudFront", "CacheHitRate", "DistributionId", "${DistributionId}", "Region", "Global"]
+                ]
+              }
+            }
+          ]
+        }
+Outputs:
+  DashboardName:
+    Value: !Ref CloudWatchDashboard
+  CloudFront5xxAlarmName:
+    Value: !Ref CloudFront5xxAlarm

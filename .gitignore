@@ -1,0 +1,106 @@
+.DS_Store
+*.tfstate
+*.tfstate.backup
+cdk.out/
+node_modules/
+.env
+*.pem
+.vscode/
+.idea/
+*.log
+*.bak
+*.swp
+*.swo
+*.tmp
+*.cache/
+
+# ── Binary: Compiled code ────────────────────────────────────────────────────
+*.pyc
+*.pyo
+*.so
+*.dll
+*.dylib
+*.exe
+*.whl
+
+# ── Binary: Terraform provider binaries ──────────────────────────────────────
+# No extension — matched by directory pattern
+**/registry.terraform.io/**/terraform-provider-*_x5
+
+# ── Generated: Python cache ───────────────────────────────────────────────────
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# ── Generated: Node dependencies ─────────────────────────────────────────────
+node_modules/
+*.min.js
+*.min.css
+*.js.map
+*.css.map
+
+# ── Generated: Dependency lock files ─────────────────────────────────────────
+package-lock.json
+yarn.lock
+Pipfile.lock
+.terraform.lock.hcl
+poetry.lock
+
+# ── Generated: Python package dist metadata ───────────────────────────────────
+**/*.dist-info/RECORD
+**/*.dist-info/WHEEL
+**/*.dist-info/INSTALLER
+**/*.dist-info/top_level.txt
+**/*.dist-info/
+py.typed
+
+# ── Generated: Terraform provider mirrors / offline cache ────────────────────
+**/.terraform/
+
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+**/.history/
+
+# ── IDE / Editor metadata ────────────────────────────────────────────────────
+*.iml
+*.swp
+*.swo
+
+#backup files
+*.bak
+*.bkp
+*.backup
+
+# Logs, build output, editor files
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+
+# GitLab CI deploy dotenv: holds live AWS resource IDs resolved by deploy.sh.
+deploy.env
+
+# Scratch directory used by ci/run-egress-probe.sh.
+.probe-tmp/  

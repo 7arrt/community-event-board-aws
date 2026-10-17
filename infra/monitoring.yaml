@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Community Event Board monitoring — CloudWatch alarms for application health
+
+# Metrics-only alarms, deliberately no SNS topic.
+#
+# An SNS topic in a throwaway sandbox is a trap: an email subscription stays
+# Pending until someone clicks the confirmation link, and if that never happens
+# the topic looks configured while paging nobody. A metric-only alarm always
+# exists, always shows its state in the console, and cannot fail silently. The
+# verification agent can read the alarm states directly.
+
+Parameters:
+  AlbDimensionValue:
+    Type: String
+    Description: LoadBalancer metric dimension suffix (app/name/id), not the full ARN.
+  TargetGroupDimensionValue:
+    Type: String
+    Description: TargetGroup metric dimension suffix (targetgroup/name/id), not the full ARN.
+  ImagesBucketName:
+    Type: String
+    Description: Images bucket name from the community-board-storage stack outputs.
+  EventsTableName:
+    Type: String
+    Description: DynamoDB events table name from the community-board-storage stack outputs.
+  EvaluationPeriods:
+    Type: Number
+    Default: 2
+    Description: Consecutive periods that must breach before the alarm fires.
+  DatapointsToAlarm:
+    Type: Number
+    Default: 2
+    Description: Breaching datapoints required within EvaluationPeriods.
+
+Resources:
+  # The load-bearing alarm: if this fires, the app tier is not being reached.
+  # It is the single metric that proves CloudFront -> ALB -> EC2 is intact.
+  UnhealthyHostCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-unhealthy-hosts'
+      AlarmDescription: >-
+        Targets failing their /health check. Fires when the ALB cannot reach the
+        application. This is the primary application-health signal.
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbDimensionValue
+        - Name: TargetGroup
+          Value: !Ref TargetGroupDimensionValue
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: !Ref EvaluationPeriods
+      DatapointsToAlarm: !Ref DatapointsToAlarm
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-target-response-time'
+      AlarmDescription: >-
+        p95 target response time above 2 seconds. Indicates the application tier
+        is saturated. This is a signal, not a capacity claim: no load test has
+        been run, so the 500-concurrent-user target remains unproven.
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbDimensionValue
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: !Ref EvaluationPeriods
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Target5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-target-5xx'
+      AlarmDescription: Application returned 5xx responses to the load balancer.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbDimensionValue
+        - Name: TargetGroup
+          Value: !Ref TargetGroupDimensionValue
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: !Ref EvaluationPeriods
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # A cheap guard against the failure mode that costs the most: an empty
+  # bucket policy quietly granting public access.
+  StorageErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-s3-storage-errors'
+      AlarmDescription: >-
+        S3 returned errors for the images bucket. A sustained rate means image
+        delivery through CloudFront/OAC is failing.
+      Namespace: AWS/S3
+      MetricName: 4xxErrors
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref ImagesBucketName
+        - Name: FilterId
+          Value: BucketLevelMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: !Ref EvaluationPeriods
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-overview'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Application health (ALB)",
+                "region": "${AWS::Region}",
+                "period": 60,
+                "stat": "Average",
+                "metrics": [
+                  ["AWS/ApplicationELB", "UnHealthyHostCount", "LoadBalancer", "${AlbDimensionValue}", "TargetGroup", "${TargetGroupDimensionValue}"],
+                  ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${AlbDimensionValue}"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Latency and errors",
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "metrics": [
+                  ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${AlbDimensionValue}"],
+                  [".", "HTTPCode_Target_5XX_Count", "LoadBalancer", "${AlbDimensionValue}", "TargetGroup", "${TargetGroupDimensionValue}"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "S3 request errors",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "metrics": [
+                  ["AWS/S3", "4xxErrors", "BucketName", "${ImagesBucketName}", "FilterId", "BucketLevelMetrics"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "DynamoDB table capacity",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${EventsTableName}"],
+                  [".", "ConsumedWriteCapacityUnits", ".", "."]
+                ]
+              }
+            }
+          ]
+        }
+
+  AlarmTopicPlaceholder:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+Outputs:
+  DashboardName:
+    Value: !Ref CloudWatchDashboard
+    Description: Regional CloudWatch dashboard for ALB, S3, and DynamoDB metrics.
+  UnhealthyHostCountAlarmName:
+    Value: !Ref UnhealthyHostCountAlarm
+    Description: >-
+      Primary target-health alarm. Metric-only by design: no SNS topic, because
+      an unconfirmed subscription would look configured while paging nobody.
+  AlarmNames:
+    Value: !Sub '${UnhealthyHostCountAlarm},${LatencyAlarm},${Target5xxAlarm},${StorageErrorAlarm}'
+    Description: All regional alarms in this stack.

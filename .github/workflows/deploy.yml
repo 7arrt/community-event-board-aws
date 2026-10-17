@@ -1,0 +1,192 @@
+# Community Event Board — GitHub Actions deploy pipeline.
+#
+# This is the GitHub Actions equivalent of the GitLab CI pipeline in
+# .gitlab-ci.yml. Both pipelines call the same provider-neutral scripts in
+# `ci/`, so the deployment logic exists in exactly one place and the two
+# providers cannot drift apart.
+#
+# The stages mirror the GitLab pipeline one-for-one:
+#
+#   preflight -> validate -> template-lint -> deploy -> verify
+#
+# and keep the same contract: the run goes green only when the application is
+# genuinely serving and the origin boundary holds. The deploy targets a sandbox
+# nobody can inspect, so a green run on a half-deployed stack is worse than a
+# failing one.
+#
+# Deploy order is six CloudFormation passes, not three — see ci/deploy.sh. The
+# bucket's CORS must name the CloudFront domain, and that domain does not exist
+# until the ALB stack has run.
+#
+# CREDENTIALS
+#   The AWS jobs are opt-in. They run only when the repository *variable*
+#   AWS_DEPLOY_ENABLED is `true` and these repository *secrets* exist:
+#     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+#   plus the repository variable AWS_DEFAULT_REGION (default eu-west-1).
+#   With no credentials configured, `validate` still runs and every AWS job is
+#   skipped — so the pipeline is green out of the box and never reports a
+#   deploy it did not make.
+#
+#   Nothing is hardcoded: every resource identifier is read from
+#   describe-stacks at run time and no local AWS profile is assumed.
+#
+# The runner is pinned to ubuntu-24.04 rather than ubuntu-latest, so a runner
+# image migration cannot silently change how the deploy behaves.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A deploy mutates live stacks. Never run two at once, and never cancel one
+# mid-flight: an interrupted CloudFormation pass leaves a half-deployed
+# environment. Mirrors `interruptible: false` in .gitlab-ci.yml.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION || 'eu-west-1' }}
+  AWS_EC2_METADATA_DISABLED: "true"
+  # The instance must reach AWS APIs (DynamoDB, S3) for the application to work
+  # at all. Do not let a credential helper or IMDS lookup hang a step.
+  AWS_SHARED_CREDENTIALS_FILE: /dev/null
+  HEALTH_TIMEOUT_SECONDS: "600"
+  START_WAIT_SECONDS: "60"
+
+jobs:
+  # --- preflight ------------------------------------------------------------
+  # Reports what the runner actually provides and fails with an actionable
+  # message rather than a cryptic downstream error when credentials are
+  # missing.
+
+  preflight:
+    name: preflight
+    if: vars.AWS_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Report runner and toolchain
+        run: |
+          echo "runner:  $RUNNER_OS / $RUNNER_ARCH"
+          echo "region:  $AWS_DEFAULT_REGION"
+          aws --version
+          python3 --version
+      - name: Require credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          missing=0
+          for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::$v is not set — add it as a repository secret (AWS_DEFAULT_REGION is a repository variable)"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'eu-west-1' }}
+      - name: Verify the caller identity
+        run: aws sts get-caller-identity
+
+  # --- validate -------------------------------------------------------------
+  # Structure and policy checks before anything is created. Runs the local
+  # offline suite, so a malformed template fails in seconds instead of half way
+  # through a deploy. This job needs no AWS credentials and always runs.
+
+  validate:
+    name: validate (pytest)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dev requirements
+        run: pip install --quiet --disable-pip-version-check -r requirements-dev.txt
+      - name: Run the offline test suite
+        run: python -m pytest -q
+
+  template-lint:
+    name: template-lint
+    if: vars.AWS_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'eu-west-1' }}
+      - name: Validate every CloudFormation template
+        run: |
+          for t in infra/storage.yaml infra/compute.yaml infra/alb-cloudfront.yaml; do
+            echo "==> $t"
+            aws cloudformation validate-template --template-body "file://$t" >/dev/null
+          done
+
+  # --- deploy ---------------------------------------------------------------
+  # One job rather than four. The whole deploy takes about ten minutes, and one
+  # job needs no cross-job value plumbing, which removes a class of
+  # runner-specific failure. The single artifact that must cross the boundary —
+  # deploy.env — is published for the verify job.
+
+  deploy:
+    name: deploy (6 CloudFormation passes)
+    if: vars.AWS_DEPLOY_ENABLED == 'true'
+    needs: [preflight, validate, template-lint]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'eu-west-1' }}
+      - name: Deploy the stacks in dependency order
+        run: bash ci/deploy.sh
+      - name: Publish deploy.env for the verify job
+        uses: actions/upload-artifact@v7
+        with:
+          name: deploy-env
+          path: deploy.env
+          retention-days: 1
+
+  # --- verify ---------------------------------------------------------------
+  # Consumes deploy.env and reaches back into AWS rather than threading every
+  # value through job outputs, so the gate is checked against live state.
+
+  verify:
+    name: verify (live endpoint + boundary)
+    if: vars.AWS_DEPLOY_ENABLED == 'true'
+    needs: [deploy]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: deploy-env
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION || 'eu-west-1' }}
+      - name: Verify the deployment is genuinely serving
+        run: |
+          set -a
+          . ./deploy.env
+          set +a
+          bash ci/verify.sh

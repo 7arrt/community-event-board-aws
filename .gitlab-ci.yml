@@ -1,0 +1,137 @@
+# Community Event Board — GitLab CI pipeline.
+#
+# Triggers on every push to main. Exits 0 only when the application is
+# genuinely serving. The pipeline deploys into a sandbox nobody can inspect, so
+# a pipeline that reports success on a half-deployed stack is worse than one
+# that fails loudly.
+#
+# Deploy order is four CloudFormation operations, not three. See
+# ci/deploy.sh for why: the bucket's CORS must name the CloudFront
+# domain, which does not exist until the ALB stack has run.
+#
+# Every resource identifier is read from describe-stacks at run time. Nothing is
+# hardcoded and no local AWS profile is assumed — CI has no ~/.aws/config.
+
+stages:
+  - preflight
+  - validate
+  - deploy
+  - verify
+  - cleanup
+
+default:
+  interruptible: false
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+variables:
+  AWS_CLI_VERSION: "2"
+  AWS_DEFAULT_REGION: "eu-west-1"
+  AWS_EC2_METADATA_DISABLED: "true"
+  PYTHONDONTWRITEBYTECODE: "1"
+  # The instance must reach AWS APIs (DynamoDB, S3) for the application to work
+  # at all. Do not let a credential helper or IMDS lookup hang a job.
+  AWS_SHARED_CREDENTIALS_FILE: /dev/null
+  HEALTH_TIMEOUT_SECONDS: "600"
+  START_WAIT_SECONDS: "60"
+
+# --- preflight ----------------------------------------------------------------
+# Reports what the runner actually provides. This exists because the executor
+# type is unknown: image: keys are required by a Docker or Kubernetes executor
+# and ignored by a shell executor. Running this once tells us which we have
+# instead of guessing, and it fails with an actionable message rather than a
+# cryptic command-not-found.
+
+preflight:
+  stage: preflight
+  image: amazon/aws-cli:latest
+  script:
+    - 'echo "Runner: $CI_RUNNER_DESCRIPTION"'
+    - 'echo "Executor tags: $CI_RUNNER_TAGS"'
+    - 'echo "Shell: $SHELL"'
+    - aws --version
+    - if command -v python3 >/dev/null 2>&1; then python3 --version; else echo "python3 MISSING"; exit 1; fi
+    - if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then echo "AWS_ACCESS_KEY_ID is not set"; exit 1; fi
+    - if [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then echo "AWS_SECRET_ACCESS_KEY is not set"; exit 1; fi
+    - if [ -z "${AWS_DEFAULT_REGION:-}" ]; then echo "AWS_DEFAULT_REGION is not set"; exit 1; fi
+    - aws sts get-caller-identity
+
+# --- validate ----------------------------------------------------------------
+# Structure and policy checks before anything is created. Runs the local unit
+# suite and validates every template, so a malformed template fails in seconds
+# instead of half way through a deploy.
+
+validate:
+  stage: validate
+  image: python:3.12-slim
+  script:
+    - pip install --quiet --disable-pip-version-check -r requirements-dev.txt
+    - python -m pytest -q
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+template-lint:
+  stage: validate
+  image: amazon/aws-cli:latest
+  needs: []
+  script:
+    - |
+      for t in infra/storage.yaml infra/compute.yaml infra/alb-cloudfront.yaml; do
+        echo "==> $t"
+        aws cloudformation validate-template --template-body "file://$t" >/dev/null
+      done
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# --- deploy -------------------------------------------------------------------
+# A single job rather than four. The whole deploy takes about ten minutes, and
+# one job needs no cross-job artifact plumbing, which removes a class of
+# runner-specific failure. Splitting into four jobs buys per-step visibility in
+# the UI at the cost of that plumbing.
+
+deploy:
+  stage: deploy
+  image: amazon/aws-cli:latest
+  timeout: 2h
+  needs: [validate, template-lint]
+  script:
+    - chmod +x ci/deploy.sh
+    - ./ci/deploy.sh
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    expire_in: 1 day
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# --- verify -------------------------------------------------------------------
+# Consumes the dotenv from deploy. Reaches back into AWS rather than threading
+# every value through variables, so the gate is checked against live state.
+
+verify:
+  stage: verify
+  image: amazon/aws-cli:latest
+  needs: [deploy]
+  script:
+    - chmod +x ci/verify.sh
+    - ./ci/verify.sh
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# --- cleanup ------------------------------------------------------------------
+# Manual only, and never on a push. Destroying the stacks on every push would
+# delete the environment being verified.
+
+cleanup:
+  stage: cleanup
+  image: amazon/aws-cli:latest
+  when: manual
+  allow_failure: true
+  script:
+    - chmod +x ci/cleanup.sh
+    - ./ci/cleanup.sh
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual

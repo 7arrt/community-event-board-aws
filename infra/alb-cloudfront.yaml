@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Community Event Board Issue 5 ALB and CloudFront delivery
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Poc VPC ID from the compute stack outputs.
+  PublicSubnetIds:
+    Type: CommaDelimitedList
+    Description: Two public subnet IDs (two AZs) from the compute stack outputs.
+  AlbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Placeholder ALB security group adopted from the compute stack.
+  Ec2SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: EC2 security group from the compute stack; ALB health checks and traffic target it.
+  InstanceId:
+    Type: AWS::EC2::Instance::Id
+    Description: EC2 stub instance registered with the target group.
+  ImagesBucketName:
+    Type: String
+    Description: Private images bucket from the storage stack outputs.
+  ImagePrefix:
+    Type: String
+    Default: images/
+    AllowedValues: [images/]
+    Description: Image key prefix granted to CloudFront; mirrors the storage stack ImagePrefix.
+  CfOriginPrefixListId:
+    Type: String
+    Description: Regional CloudFront origin-facing managed prefix list ID (com.amazonaws.global.cloudfront.origin-facing); resolve at deploy time.
+Resources:
+  AlbSgIngressCloudFront:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourcePrefixListId: !Ref CfOriginPrefixListId
+  AlbSgEgressToEc2:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      DestinationSecurityGroupId: !Ref Ec2SecurityGroupId
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      Matcher:
+        HttpCode: '200'
+      Targets:
+        - Id: !Ref InstanceId
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroupId
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: 'false'
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+  ImagesOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-images-oac'
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        OriginAccessControlOriginType: s3
+  ImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImagesBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOACRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${ImagesBucketName}/${ImagePrefix}*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        PriceClass: PriceClass_100
+        DefaultRootObject: ''
+        Origins:
+          - Id: alb-origin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+          - Id: s3-images-origin
+            DomainName: !Sub '${ImagesBucketName}.s3.${AWS::Region}.amazonaws.com'
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref ImagesOriginAccessControl
+        DefaultCacheBehavior:
+          TargetOriginId: alb-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: /images/*
+            TargetOriginId: s3-images-origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            Compress: true
+Outputs:
+  DistributionDomainName:
+    Value: !GetAtt Distribution.DomainName
+    Description: CloudFront HTTPS endpoint for residents and CORS origin.
+  DistributionId:
+    Value: !Ref Distribution
+  AlbDNSName:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Description: Direct ALB endpoint for pre-cutover checks only.
+  TargetGroupArn:
+    Value: !Ref AppTargetGroup
+    Description: Target group ARN owned by this delivery stack.
